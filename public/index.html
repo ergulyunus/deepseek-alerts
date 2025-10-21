@@ -1,0 +1,219 @@
+<!doctype html>
+<html lang="tr">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>DeepSeek Alerts</title>
+  <style>
+    :root { 
+      --bg:#0b0b0f; --card:#121219; --line:#222; --muted:#9aa; 
+      --ok:#00d084; --bad:#ff5c5c; --warn:#f7b500; 
+    }
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; background:var(--bg); color:#fff; margin:0; }
+    header { padding:16px 20px; border-bottom: 1px solid var(--line); }
+    main { padding:20px; max-width: 1100px; margin: 0 auto; }
+    .row { display:flex; gap:12px; align-items:center; }
+    .between { justify-content: space-between; }
+    .badge { padding:3px 8px; border-radius:999px; border:1px solid #333; font-size:12px; }
+    button { background:#1e1e2a; color:#fff; border:1px solid #333; border-radius:8px; padding:8px 12px; cursor:pointer; }
+    .card { background:var(--card); border:1px solid var(--line); border-radius:16px; padding:16px; margin:12px 0; }
+    .muted { color:var(--muted); font-size:12px; }
+    table { width:100%; border-collapse: collapse; }
+    th, td { padding:10px; border-bottom:1px solid var(--line); text-align:left; }
+    th { color:#aaa; font-weight:600; }
+
+    /* Uyarı kutuları */
+    .event { padding:10px 12px; border-radius:12px; margin:10px 0; }
+    .event.AL  { border-left:4px solid var(--ok);  background:rgba(0,208,132,0.1); }
+    .event.SAT { border-left:4px solid var(--bad); background:rgba(255,92,92,0.1); }
+    .event.WARN{ border-left:4px solid var(--warn);background:rgba(247,181,0,0.1); }
+
+    .icon { font-size:16px; margin-right:6px; }
+    .grid { display:grid; grid-template-columns: 1fr 1fr; gap:16px; }
+    @media (max-width: 900px){ .grid { grid-template-columns:1fr; } }
+
+    .controls { gap:16px; }
+    .controls label { cursor:pointer; user-select:none; }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="row between">
+      <div><strong>DeepSeek Alerts v2</strong> <span class="badge" id="badge">yok</span></div>
+      <div class="row controls">
+        <label class="muted"><input type="checkbox" id="soundChk" checked> Ses</label>
+        <label class="muted"><input type="checkbox" id="autoChk" checked> 10 sn otomatik yenile</label>
+        <button id="refreshBtn">Yenile</button>
+      </div>
+    </div>
+  </header>
+
+  <main class="grid">
+    <!-- Pozisyonlar -->
+    <div class="card">
+      <div class="row between" style="margin-bottom:10px">
+        <strong>Pozisyonlar</strong>
+      </div>
+      <table>
+        <thead>
+          <tr><th>Symbol</th><th>Size</th><th>Avg Price</th><th>PnL</th></tr>
+        </thead>
+        <tbody id="tbody"></tbody>
+      </table>
+    </div>
+
+    <!-- Uyarılar -->
+    <div class="card">
+      <div class="row between" style="margin-bottom:10px">
+        <strong>Uyarılar</strong>
+      </div>
+      <div id="events"></div>
+      <div class="muted" id="eventsEmpty">Henüz uyarı yok.</div>
+    </div>
+  </main>
+
+<script>
+let lastEventKey = "";
+let audioCtx = null;
+
+function ensureAudio() {
+  if (audioCtx) return audioCtx;
+  const Ctx = window.AudioContext || window.webkitAudioContext;
+  if (!Ctx) return null;
+  audioCtx = new Ctx();
+  return audioCtx;
+}
+
+function playTone(freq=880, dur=0.25, type='sine') {
+  const ctx = ensureAudio();
+  if (!ctx) return;
+  const osc = ctx.createOscillator();
+  const gain = ctx.createGain();
+  osc.type = type;
+  osc.frequency.value = freq;
+  osc.connect(gain);
+  gain.connect(ctx.destination);
+
+  const t0 = ctx.currentTime;
+  gain.gain.setValueAtTime(0.0001, t0);
+  gain.gain.exponentialRampToValueAtTime(0.2, t0 + 0.02);
+  gain.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+  osc.start(t0);
+  osc.stop(t0 + dur + 0.02);
+}
+
+function soundFor(type) {
+  const soundOn = document.getElementById('soundChk').checked;
+  if (!soundOn) return;
+
+  // Basit ses şeması:
+  // AL   → iki kısa yükselen bip (pozitif his)
+  // SAT  → tek uzun, daha düşük frekanslı ton
+  // WARN → kısa tek bip
+  if (type === 'AL') {
+    playTone(880, 0.18, 'sine');
+    setTimeout(() => playTone(1046, 0.18, 'sine'), 220); // C6
+  } else if (type === 'SAT') {
+    playTone(330, 0.35, 'sawtooth');
+  } else {
+    playTone(700, 0.15, 'triangle');
+  }
+}
+
+async function loadPositions() {
+  const r = await fetch('/positions');
+  const data = await r.json();
+  const tb = document.getElementById('tbody');
+  tb.innerHTML = '';
+  (data.positions || []).forEach(p => {
+    const tr = document.createElement('tr');
+    tr.innerHTML = `<td>${p.symbol||''}</td>
+                    <td>${p.size||''}</td>
+                    <td>${p.avgPrice||''}</td>
+                    <td>${p.pnl||''}</td>`;
+    tb.appendChild(tr);
+  });
+  document.getElementById('badge').textContent =
+    data.updatedAt ? new Date(data.updatedAt).toLocaleString() : 'yok';
+}
+
+function renderEvents(list) {
+  const wrap = document.getElementById('events');
+  const empty = document.getElementById('eventsEmpty');
+  wrap.innerHTML = '';
+  if (!list || !list.length) {
+    empty.style.display = 'block';
+    return;
+  }
+  empty.style.display = 'none';
+
+  list.forEach(e => {
+    let cls = "WARN";
+    let icon = "⚠️";
+    let title = "Uyarı";
+
+    if (["NEW_SYMBOL","PNL_UP","PNL_UP_ABS","SIZE_CHANGE"].includes(e.type)) {
+      cls = "AL"; icon = "✅"; title = "AL";
+    }
+    if (["EXIT_SYMBOL","PNL_DOWN","PNL_DOWN_ABS"].includes(e.type)) {
+      cls = "SAT"; icon = "❌"; title = "SAT";
+    }
+
+    const d = document.createElement('div');
+    d.className = `event ${cls}`;
+    d.innerHTML = `
+      <div style="display:flex;justify-content:space-between;gap:8px;">
+        <div><span class="icon">${icon}</span><strong>${title}</strong> — <span>${e.symbol||''}</span></div>
+        <span class="muted">${new Date().toLocaleTimeString()}</span>
+      </div>
+      <div class="muted" style="margin-top:6px">${e.msg||''}</div>`;
+    wrap.prepend(d);
+  });
+}
+
+async function loadEvents(playSound=true) {
+  const r = await fetch('/events');
+  const data = await r.json();
+  const list = data.events || [];
+
+  // yeni uyarı var mı? (basit anahtar)
+  const key = JSON.stringify(list);
+  if (playSound && list.length && key !== lastEventKey) {
+    // En yeni event’in tipine göre ses çal
+    const last = list[list.length - 1];
+    if (last) {
+      let cls = "WARN";
+      if (["NEW_SYMBOL","PNL_UP","PNL_UP_ABS","SIZE_CHANGE"].includes(last.type)) cls = "AL";
+      if (["EXIT_SYMBOL","PNL_DOWN","PNL_DOWN_ABS"].includes(last.type)) cls = "SAT";
+      soundFor(cls);
+    }
+    lastEventKey = key;
+  }
+  renderEvents(list);
+}
+
+async function doRefresh() {
+  const btn = document.getElementById('refreshBtn');
+  btn.disabled = true; btn.textContent = 'Yenileniyor...';
+  try { await fetch('/refresh', { method:'POST' }); } catch(e) {}
+  await Promise.all([loadPositions(), loadEvents()]);
+  btn.disabled = false; btn.textContent = 'Yenile';
+}
+
+document.getElementById('refreshBtn').addEventListener('click', () => {
+  // iOS/Chrome autio policy: kullanıcı etkileşimi sonrası ses için context başlatma
+  ensureAudio();
+  doRefresh();
+});
+
+// İlk yükleme
+loadPositions(); loadEvents(false);
+
+// Otomatik yenile
+setInterval(() => {
+  const auto = document.getElementById('autoChk').checked;
+  if (auto) { loadEvents(); loadPositions(); }
+}, 10000);
+</script>
+</body>
+</html>
